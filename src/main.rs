@@ -1,10 +1,15 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::Path,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose, Engine};
+use cookie::Cookie;
 use regex::Regex;
+use serde_json::{json, Value};
 
 async fn ok() -> Result<String, StatusCode> {
     Ok(String::from(""))
@@ -122,6 +127,69 @@ async fn elf_count(body: String) -> Result<Json<ElfCount>, StatusCode> {
     .into())
 }
 
+async fn decode(headers: HeaderMap) -> Result<String, StatusCode> {
+    let header_cookies = headers["cookie"].to_str().unwrap();
+    let c = Cookie::parse(header_cookies).unwrap();
+    let encoded = c.value();
+    let decoded = general_purpose::STANDARD.decode(encoded).unwrap();
+    let s = std::str::from_utf8(decoded.as_slice()).unwrap();
+
+    Ok(s.to_string())
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct RecipeInput {
+    recipe: HashMap<String, Value>,
+    pantry: HashMap<String, Value>,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct RecipeOutput {
+    cookies: u64,
+    pantry: HashMap<String, Value>,
+}
+
+async fn bake(headers: HeaderMap) -> Result<Json<RecipeOutput>, StatusCode> {
+    let header_cookies = headers["cookie"].to_str().unwrap();
+    let c = Cookie::parse(header_cookies).unwrap();
+    let encoded = c.value();
+    let decoded = general_purpose::STANDARD.decode(encoded).unwrap();
+    let json = std::str::from_utf8(decoded.as_slice()).unwrap();
+    let input: RecipeInput = serde_json::from_str(json).unwrap();
+    let mut cookies = u64::MAX;
+
+    for (k, v) in input.recipe.iter() {
+        let v = v.as_u64().unwrap();
+
+        if v > 0 {
+            if let Some(pantry_value) = input.pantry.get(k) {
+                let pantry_value = pantry_value.as_u64().unwrap();
+                cookies = cookies.min(pantry_value / v);
+            } else {
+                cookies = 0;
+            }
+        }
+    }
+
+    let mut out = RecipeOutput {
+        cookies,
+        pantry: input.pantry,
+    };
+
+    for (k, v) in input.recipe.iter() {
+        let v = v.as_u64().unwrap();
+
+        if v > 0 {
+            if let Some(pantry_value) = out.pantry.get_mut(k) {
+                let pantry_value_u = pantry_value.as_u64().unwrap();
+                *pantry_value = json!(pantry_value_u - cookies * v);
+            }
+        }
+    }
+
+    Ok(out.into())
+}
+
 #[shuttle_runtime::main]
 async fn main() -> shuttle_axum::ShuttleAxum {
     let router = Router::new()
@@ -130,7 +198,9 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/1/*key", get(exclusive_cube))
         .route("/4/strength", post(strength))
         .route("/4/contest", post(contest))
-        .route("/6", post(elf_count));
+        .route("/6", post(elf_count))
+        .route("/7/decode", get(decode))
+        .route("/7/bake", get(bake));
 
     Ok(router.into())
 }
