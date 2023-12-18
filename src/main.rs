@@ -1,28 +1,33 @@
 use axum::{
-    extract::{Multipart, Path},
+    extract::{Multipart, Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine};
+use chrono::{DateTime, Utc};
 use cookie::Cookie;
 use image::{io::Reader as ImageReader, GenericImageView, Pixel};
 use itertools::Itertools;
+use log::info;
+use num_traits::PrimInt;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::io::Cursor;
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{io::Cursor, sync::Mutex};
 use tower_http::services::ServeDir;
 
 async fn ok() -> Result<String, StatusCode> {
-    Ok(String::from(""))
+    Ok(String::from("okay"))
 }
 
 async fn error() -> Result<String, StatusCode> {
+    info!("-1 started");
     Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn exclusive_cube(Path(params): Path<Vec<(String, String)>>) -> Result<String, StatusCode> {
+    info!("1 started");
     let nums = params[0]
         .1
         .split('/')
@@ -41,6 +46,7 @@ struct Reindeer {
 }
 
 async fn strength(Json(reindeers): Json<Vec<Reindeer>>) -> Result<String, StatusCode> {
+    info!("4 strength started");
     let mut sum = 0;
 
     for reindeer in reindeers {
@@ -64,6 +70,7 @@ struct Champion {
 }
 
 async fn contest(Json(champions): Json<Vec<Champion>>) -> Result<String, StatusCode> {
+    info!("4 contest started");
     let mut fastest = champions[0].clone();
     let mut tallest = champions[0].clone();
     let mut magician = champions[0].clone();
@@ -112,6 +119,7 @@ struct ElfCount {
 }
 
 async fn elf_count(body: String) -> Result<Json<ElfCount>, StatusCode> {
+    info!("6 started");
     let elf = body.matches("elf").count();
 
     let mut elf_on_a_shelf = 0;
@@ -131,6 +139,7 @@ async fn elf_count(body: String) -> Result<Json<ElfCount>, StatusCode> {
 }
 
 async fn decode(headers: HeaderMap) -> Result<String, StatusCode> {
+    info!("7 decode started");
     let header_cookies = headers["cookie"].to_str().unwrap();
     let c = Cookie::parse(header_cookies).unwrap();
     let encoded = c.value();
@@ -153,6 +162,7 @@ struct RecipeOutput {
 }
 
 async fn bake(headers: HeaderMap) -> Result<Json<RecipeOutput>, StatusCode> {
+    info!("7 bake started");
     let header_cookies = headers["cookie"].to_str().unwrap();
     let c = Cookie::parse(header_cookies).unwrap();
     let encoded = c.value();
@@ -199,6 +209,7 @@ struct PokeApi {
 }
 
 async fn weight(Path(pokedex_number): Path<String>) -> Result<String, StatusCode> {
+    info!("8 weight started");
     let body = reqwest::get(format!(
         "https://pokeapi.co/api/v2/pokemon/{}",
         pokedex_number
@@ -216,6 +227,7 @@ async fn weight(Path(pokedex_number): Path<String>) -> Result<String, StatusCode
 }
 
 async fn drop(Path(pokedex_number): Path<String>) -> Result<String, StatusCode> {
+    info!("8 drop started");
     let body = reqwest::get(format!(
         "https://pokeapi.co/api/v2/pokemon/{}",
         pokedex_number
@@ -236,6 +248,7 @@ async fn drop(Path(pokedex_number): Path<String>) -> Result<String, StatusCode> 
 }
 
 async fn red_pixels(mut multipart: Multipart) -> Result<String, StatusCode> {
+    info!("11 started");
     let mut out = 0;
 
     while let Some(field) = multipart.next_field().await.unwrap() {
@@ -258,8 +271,88 @@ async fn red_pixels(mut multipart: Multipart) -> Result<String, StatusCode> {
     Ok(out.to_string())
 }
 
+struct AppState {
+    data: Arc<Mutex<HashMap<String, SystemTime>>>,
+}
+
+async fn save_string(
+    Path(s): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<(), StatusCode> {
+    info!("12 save started");
+    let mut data = state.data.lock().expect("mutex was poisoned");
+    data.insert(s.clone(), SystemTime::now());
+
+    Ok(())
+}
+
+async fn load_string(
+    Path(s): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<String, StatusCode> {
+    info!("12 load started");
+    let data = state.data.lock().expect("mutex was poisoned");
+    let now = SystemTime::now();
+    let t = data.get(&s).unwrap();
+
+    Ok(now.duration_since(*t).unwrap().as_secs().to_string())
+}
+
+async fn ulids(Json(ulid_strings): Json<Vec<String>>) -> Result<String, StatusCode> {
+    info!("12 ulids started");
+    let uuid_strings = ulid_strings
+        .into_iter()
+        .map(|ulid_string| {
+            let ulid_bytes = ulid::Ulid::from_string(&ulid_string).unwrap().to_bytes();
+            uuid::Uuid::from_bytes(ulid_bytes).to_string()
+        })
+        .rev()
+        .collect::<Vec<String>>();
+
+    Ok(format!("{:?}", uuid_strings))
+}
+
+#[derive(serde::Serialize, Debug, Clone, Default)]
+struct UlidStats {
+    #[serde(rename = "christmas eve")]
+    christmas_eve: u16,
+    weekday: u16,
+    #[serde(rename = "in the future")]
+    in_the_future: u16,
+    #[serde(rename = "LSB is 1")]
+    lsb_is_1: u16,
+}
+
+pub fn get_lsb<N: PrimInt>(n: N) -> N {
+    n & N::one()
+}
+
+async fn ulids_weekday(
+    Path(expected_weekday): Path<u8>,
+    Json(ulid_strings): Json<Vec<String>>,
+) -> Result<Json<UlidStats>, StatusCode> {
+    info!("12 ulids weekday started");
+    let mut ulid_stats = UlidStats::default();
+    for ulid_string in ulid_strings.into_iter() {
+        let ulid = ulid::Ulid::from_string(&ulid_string).unwrap();
+        let datetime: DateTime<Utc> = ulid.datetime().into();
+        let day_month = datetime.format("%d-%m").to_string();
+        let weekday = datetime.format("%u").to_string().parse::<u8>().unwrap() - 1;
+
+        ulid_stats.christmas_eve += (day_month == "24-12") as u16;
+        ulid_stats.weekday += (weekday == expected_weekday) as u16;
+        ulid_stats.in_the_future += (ulid.datetime() > SystemTime::now()) as u16;
+        ulid_stats.lsb_is_1 += (get_lsb(ulid.to_bytes()[15]) == 1) as u16;
+    }
+
+    Ok(ulid_stats.into())
+}
+
 #[shuttle_runtime::main]
 async fn main() -> shuttle_axum::ShuttleAxum {
+    let shared_state = Arc::new(AppState {
+        data: Arc::new(Mutex::new(HashMap::new())),
+    });
     let router = Router::new()
         .route("/", get(ok))
         .route("/-1/error", get(error))
@@ -272,7 +365,12 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/8/weight/:pokedex_number", get(weight))
         .route("/8/drop/:pokedex_number", get(drop))
         .nest_service("/11/assets", ServeDir::new("assets"))
-        .route("/11/red_pixels", post(red_pixels));
+        .route("/11/red_pixels", post(red_pixels))
+        .route("/12/save/:string", post(save_string))
+        .route("/12/load/:string", get(load_string))
+        .with_state(shared_state)
+        .route("/12/ulids", post(ulids))
+        .route("/12/ulids/:weekday", post(ulids_weekday));
 
     Ok(router.into())
 }
