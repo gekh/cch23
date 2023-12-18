@@ -210,7 +210,6 @@ async fn weight(Path(pokedex_number): Path<String>) -> Result<String, StatusCode
     .map_err(|_err| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut input: PokeApi = serde_json::from_str(body.as_str()).unwrap();
-    println!("input = {:?}", input);
     input.weight /= 10.;
 
     Ok(input.weight.to_string())
