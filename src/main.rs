@@ -1,15 +1,18 @@
-use std::collections::HashMap;
-
 use axum::{
-    extract::Path,
+    extract::{Multipart, Path},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine};
 use cookie::Cookie;
+use image::{io::Reader as ImageReader, GenericImageView, Pixel};
+use itertools::Itertools;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::Cursor;
+use tower_http::services::ServeDir;
 
 async fn ok() -> Result<String, StatusCode> {
     Ok(String::from(""))
@@ -233,6 +236,29 @@ async fn drop(Path(pokedex_number): Path<String>) -> Result<String, StatusCode> 
     Ok(out.to_string())
 }
 
+async fn red_pixels(mut multipart: Multipart) -> Result<String, StatusCode> {
+    let mut out = 0;
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let data = field.bytes().await.unwrap();
+        let img = ImageReader::new(Cursor::new(data))
+            .with_guessed_format()
+            .map_err(|_err| StatusCode::INTERNAL_SERVER_ERROR)?
+            .decode()
+            .map_err(|_err| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        for (_, _, rgba) in img.pixels() {
+            let (&r, &g, &b, _) = rgba.channels().into_iter().collect_tuple().unwrap();
+
+            if r.saturating_sub(g).saturating_sub(b) > 0 {
+                out += 1;
+            }
+        }
+    }
+
+    Ok(out.to_string())
+}
+
 #[shuttle_runtime::main]
 async fn main() -> shuttle_axum::ShuttleAxum {
     let router = Router::new()
@@ -245,7 +271,9 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/7/decode", get(decode))
         .route("/7/bake", get(bake))
         .route("/8/weight/:pokedex_number", get(weight))
-        .route("/8/drop/:pokedex_number", get(drop));
+        .route("/8/drop/:pokedex_number", get(drop))
+        .nest_service("/11/assets", ServeDir::new("assets"))
+        .route("/11/red_pixels", post(red_pixels));
 
     Ok(router.into())
 }
