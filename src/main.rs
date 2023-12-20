@@ -1,12 +1,17 @@
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{
+        ws::{Message, WebSocket},
+        Multipart, Path, State, WebSocketUpgrade,
+    },
     http::{HeaderMap, StatusCode},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine};
 use chrono::{DateTime, Utc};
 use cookie::Cookie;
+use futures::{sink::SinkExt, stream::StreamExt};
 use image::{io::Reader as ImageReader, GenericImageView, Pixel};
 use itertools::Itertools;
 use log::info;
@@ -14,8 +19,13 @@ use num_traits::PrimInt;
 use regex::Regex;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::SystemTime,
+};
 use std::{io::Cursor, sync::Mutex};
+use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -773,6 +783,181 @@ fn has_two_consecutive_chars(s: &str) -> bool {
     false
 }
 
+async fn ws_ping(ws: WebSocketUpgrade) -> Response {
+    info!("19 ws ping started");
+    ws.on_upgrade(|socket| ws_ping_socket(socket))
+}
+
+async fn ws_ping_socket(mut socket: WebSocket) {
+    let mut game_started = false;
+    while let Some(msg) = socket.recv().await {
+        let msg = if let Ok(msg) = msg {
+            msg
+        } else {
+            // client disconnected
+            return;
+        };
+
+        match msg {
+            axum::extract::ws::Message::Text(text) => {
+                if text == "ping" && game_started {
+                    if let Err(err) = socket.send(Message::Text("pong".to_string())).await {
+                        print!("Error: {:?}", err);
+                    }
+                } else if text == "serve" {
+                    game_started = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+struct TweeterState {
+    views: Arc<Mutex<u32>>,
+    // We require unique usernames. This tracks which usernames have been taken.
+    user_set: Mutex<HashSet<String>>,
+    // Channels used to send messages to all connected clients.
+    rooms: Mutex<HashMap<usize, broadcast::Sender<String>>>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct UserMsgIn {
+    message: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct UserMsgOut {
+    user: String,
+    message: String,
+}
+
+async fn tweeter_reset(
+    State(state): State<Arc<TweeterState>>,
+) -> Result<String, (StatusCode, String)> {
+    info!("19 tweeter reset started");
+    let mut views = state.views.lock().expect("mutex was poisoned");
+    *views = 0;
+
+    Ok("OK".to_string())
+}
+
+async fn tweeter_views(
+    State(state): State<Arc<TweeterState>>,
+) -> Result<String, (StatusCode, String)> {
+    info!("19 tweeter views started");
+    let views = state.views.lock().expect("mutex was poisoned");
+    info!("views: {views}");
+
+    Ok(views.to_string())
+}
+
+async fn tweeter_ws_handler(
+    Path((room_number, username)): Path<(usize, String)>,
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<TweeterState>>,
+) -> Response {
+    println!();
+    info!("19 tweeter ws started");
+    ws.on_upgrade(move |socket| tweeter_ws(socket, state, username, room_number))
+}
+
+async fn tweeter_ws(
+    stream: WebSocket,
+    state: Arc<TweeterState>,
+    username: String,
+    room_number: usize,
+) {
+    let (mut sender, mut receiver) = stream.split();
+
+    if !check_username(&state, &username) {
+        info!("Username {username} is already taken.");
+        // Only send our client that username is taken.
+        let _ = sender
+            .send(Message::Text(String::from("Username already taken.")))
+            .await;
+
+        return;
+    }
+
+    info!("User {username} joined room {room_number}.");
+
+    let room_tx = find_room(&state, &room_number);
+    // We subscribe *before* sending the "joined" message, so that we will also
+    // display it to our client.
+    let mut rx = room_tx.subscribe();
+    let views = state.views.clone();
+
+    // Spawn the first task that will receive broadcast messages and send text
+    // messages over the websocket to our client.
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            info!("--> send {}", msg);
+            *views.lock().unwrap() += 1;
+            // In any websocket error, break loop.
+            if sender.send(Message::Text(msg)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Clone things we want to pass (move) to the receiving task.
+    let tx = room_tx.clone();
+    let name = username.clone();
+
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+            info!("IN: {}", text);
+            let user_msg: UserMsgIn = serde_json::from_str(text.as_str()).unwrap();
+            if user_msg.message.len() > 128 {
+                continue;
+            }
+
+            let out = serde_json::json!(UserMsgOut {
+                user: name.clone(),
+                message: user_msg.message.clone(),
+            })
+            .to_string();
+
+            info!("OUT: {}", out);
+            let _ = tx.send(out.clone());
+        }
+    });
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
+
+    info!("User {username} left.");
+
+    state.user_set.lock().unwrap().remove(&username);
+}
+
+fn check_username(state: &TweeterState, name: &str) -> bool {
+    let mut user_set = state.user_set.lock().unwrap();
+
+    if !user_set.contains(name) {
+        user_set.insert(name.to_owned());
+
+        return true;
+    }
+
+    false
+}
+
+fn find_room(state: &TweeterState, room_number: &usize) -> broadcast::Sender<String> {
+    let mut rooms = state.rooms.lock().unwrap();
+
+    if let Some(room_tx) = rooms.get(&room_number) {
+        room_tx.clone()
+    } else {
+        let (tx, _) = broadcast::channel(100_000);
+        rooms.insert(room_number.clone(), tx.clone());
+        tx
+    }
+}
+
 #[shuttle_runtime::main]
 async fn axum(
     #[shuttle_shared_db::Postgres(
@@ -780,17 +965,6 @@ async fn axum(
     )]
     pool: PgPool,
 ) -> shuttle_axum::ShuttleAxum {
-    let shared_state = Arc::new(AppState {
-        data: Arc::new(Mutex::new(HashMap::new())),
-    });
-
-    sqlx::migrate!()
-        .run(&pool)
-        .await
-        .map_err(|err| shuttle_runtime::Error::Database(err.to_string()))?;
-
-    let db_state = DbState { pool };
-
     let router = Router::new()
         .route("/", get(ok))
         .route("/-1/error", get(error))
@@ -806,7 +980,9 @@ async fn axum(
         .route("/11/red_pixels", post(red_pixels))
         .route("/12/save/:string", post(save_string))
         .route("/12/load/:string", get(load_string))
-        .with_state(shared_state)
+        .with_state(Arc::new(AppState {
+            data: Arc::new(Mutex::new(HashMap::new())),
+        }))
         .route("/12/ulids", post(ulids))
         .route("/12/ulids/:weekday", post(ulids_weekday))
         .route("/13/sql", get(sql))
@@ -823,7 +999,19 @@ async fn axum(
         .route("/18/regions", post(regions))
         .route("/18/regions/total", get(regions_total))
         .route("/18/regions/top_list/:limit", get(regions_top_list))
-        .with_state(db_state);
+        .with_state(DbState { pool })
+        .route("/19/ws/ping", get(ws_ping))
+        .route("/19/reset", post(tweeter_reset))
+        .route("/19/views", get(tweeter_views))
+        .route(
+            "/19/ws/room/:room_number/user/:username",
+            get(tweeter_ws_handler),
+        )
+        .with_state(Arc::new(TweeterState {
+            views: Arc::new(Mutex::new(0)),
+            user_set: Mutex::new(HashSet::new()),
+            rooms: Mutex::new(HashMap::new()),
+        }));
 
     Ok(router.into())
 }
