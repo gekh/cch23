@@ -132,12 +132,11 @@ async fn elf_count(body: String) -> Result<Json<ElfCount>, StatusCode> {
 
     let no_elf = body.matches("shelf").count() - elf_on_a_shelf;
 
-    Ok(ElfCount {
+    Ok(Json(ElfCount {
         elf,
         elf_on_a_shelf,
         no_elf,
-    }
-    .into())
+    }))
 }
 
 async fn decode(headers: HeaderMap) -> Result<String, StatusCode> {
@@ -367,24 +366,26 @@ async fn sql(State(state): State<DbState>) -> Result<String, StatusCode> {
 }
 
 async fn reset(State(state): State<DbState>) -> Result<String, StatusCode> {
-    info!("13 reset started");
+    info!("13/18 reset started");
 
-    let sql = "DROP TABLE IF EXISTS orders";
-    sqlx::query(sql)
-        .execute(&state.pool)
-        .await
-        .map_err(|_err| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let sql = "CREATE TABLE orders (
+    let sqls = vec![
+        "DROP TABLE IF EXISTS regions;",
+        "DROP TABLE IF EXISTS orders;",
+        "CREATE TABLE regions ( id INT PRIMARY KEY, name VARCHAR(50) );",
+        "CREATE TABLE orders (
             id INT PRIMARY KEY,
             region_id INT,
             gift_name VARCHAR(50),
             quantity INT
-          )";
-    sqlx::query(sql)
-        .execute(&state.pool)
-        .await
-        .map_err(|_err| StatusCode::INTERNAL_SERVER_ERROR)?;
+        );",
+    ];
+
+    for sql in sqls {
+        sqlx::query(sql)
+            .execute(&state.pool)
+            .await
+            .map_err(|_err| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     Ok("db's reset".to_string())
 }
@@ -401,7 +402,7 @@ async fn orders(
     State(state): State<DbState>,
     Json(orders): Json<Vec<Order>>,
 ) -> Result<String, StatusCode> {
-    info!("13 orders started");
+    info!("13/18 orders started");
     let sql = "INSERT INTO orders (id, region_id, gift_name, quantity) VALUES ($1, $2, $3, $4)";
     for order in orders {
         sqlx::query(sql)
@@ -434,6 +435,81 @@ async fn orders_total(State(state): State<DbState>) -> Result<String, StatusCode
     Ok(format!("{{\"total\": {}}}", row.0.to_string()))
 }
 
+#[derive(Debug, sqlx::FromRow, serde::Serialize)]
+struct RegionsTotalRow {
+    region: String,
+    total: i64,
+}
+
+async fn regions_total(
+    State(state): State<DbState>,
+) -> Result<Json<Vec<RegionsTotalRow>>, StatusCode> {
+    info!("18 regions total started");
+    let sql = "SELECT r.name as region, sum(o.quantity) as total
+        FROM orders o
+        INNER JOIN regions r ON o.region_id = r.id
+        GROUP BY r.name
+        ORDER BY r.name;
+    ";
+
+    match sqlx::query_as::<_, RegionsTotalRow>(sql)
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => Ok(rows.into()),
+        Err(err) => {
+            dbg!(err);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize)]
+struct RegionsTopRow {
+    region: String,
+    top_gifts: sqlx::types::Json<Vec<String>>,
+}
+
+async fn regions_top_list(
+    Path(limit): Path<usize>,
+    State(state): State<DbState>,
+) -> Result<Json<Vec<RegionsTopRow>>, StatusCode> {
+    info!("18 regions top list started");
+    let sql = r#"
+        WITH grouped_orders AS (
+            SELECT region_id, gift_name, SUM(quantity) as q
+            FROM orders
+            GROUP BY region_id, gift_name
+            ORDER BY q DESC, gift_name ASC
+        )
+
+        SELECT r.name as region, json_agg(gift_name) as top_gifts
+        FROM grouped_orders go
+        LEFT JOIN regions r ON r.id = go.region_id
+        GROUP BY r.name;
+    "#;
+
+    match sqlx::query_as::<_, RegionsTopRow>(sql)
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(mut rows) => {
+            rows = rows
+                .into_iter()
+                .map(|mut r| {
+                    r.top_gifts.0 = r.top_gifts.0.into_iter().take(limit).collect();
+                    r
+                })
+                .collect();
+            Ok(rows.into())
+        }
+        Err(err) => {
+            dbg!(err);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn orders_popular(State(state): State<DbState>) -> Result<String, StatusCode> {
     info!("13 orders popular started");
     let sql = "SELECT gift_name FROM orders GROUP BY gift_name ORDER BY SUM(quantity) DESC LIMIT 1";
@@ -450,6 +526,33 @@ async fn orders_popular(State(state): State<DbState>) -> Result<String, StatusCo
             }
         },
     }
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct Region {
+    id: i64,
+    name: String,
+}
+
+async fn regions(
+    State(state): State<DbState>,
+    Json(regions): Json<Vec<Region>>,
+) -> Result<String, StatusCode> {
+    info!("18 regions started");
+    let sql = "INSERT INTO regions (id, name) VALUES ($1, $2);";
+    for r in regions {
+        sqlx::query(sql)
+            .bind(r.id)
+            .bind(r.name)
+            .execute(&state.pool)
+            .await
+            .map_err(|err| {
+                dbg!(&err);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    Ok("OK".to_string())
 }
 
 #[derive(serde::Deserialize, Debug, Clone, Default)]
@@ -706,11 +809,16 @@ async fn axum(
         .route("/13/orders", post(orders))
         .route("/13/orders/total", get(orders_total))
         .route("/13/orders/popular", get(orders_popular))
-        .with_state(db_state)
         .route("/14/unsafe", post(html_unsafe))
         .route("/14/safe", post(html_safe))
         .route("/15/nice", post(nice))
-        .route("/15/game", post(game));
+        .route("/15/game", post(game))
+        .route("/18/reset", post(reset))
+        .route("/18/orders", post(orders))
+        .route("/18/regions", post(regions))
+        .route("/18/regions/total", get(regions_total))
+        .route("/18/regions/top_list/:limit", get(regions_top_list))
+        .with_state(db_state);
 
     Ok(router.into())
 }
