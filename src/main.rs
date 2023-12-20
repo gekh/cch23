@@ -483,7 +483,11 @@ async fn regions_top_list(
             ORDER BY q DESC, gift_name ASC
         )
 
-        SELECT r.name as region, COALESCE(json_agg(gift_name) FILTER (WHERE go.region_id IS NOT NULL), '[]') AS top_gifts
+        SELECT r.name as region,
+        CASE WHEN COUNT(gift_name) = 0
+            THEN '[]'
+            ELSE json_agg(gift_name)
+            END as top_gifts
         FROM regions r
         LEFT JOIN grouped_orders go ON r.id = go.region_id
         GROUP BY r.name
