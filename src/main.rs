@@ -483,10 +483,11 @@ async fn regions_top_list(
             ORDER BY q DESC, gift_name ASC
         )
 
-        SELECT r.name as region, json_agg(gift_name) as top_gifts
-        FROM grouped_orders go
-        LEFT JOIN regions r ON r.id = go.region_id
-        GROUP BY r.name;
+        SELECT r.name as region, COALESCE(json_agg(gift_name) FILTER (WHERE go.region_id IS NOT NULL), '[]') AS top_gifts
+        FROM regions r
+        LEFT JOIN grouped_orders go ON r.id = go.region_id
+        GROUP BY r.name
+        ORDER BY r.name;
     "#;
 
     match sqlx::query_as::<_, RegionsTopRow>(sql)
