@@ -901,7 +901,6 @@ async fn tweeter_ws(
     // messages over the websocket to our client.
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
-            info!("--> send {}", msg);
             *views.lock().unwrap() += 1;
             // In any websocket error, break loop.
             if sender.send(Message::Text(msg)).await.is_err() {
@@ -916,7 +915,6 @@ async fn tweeter_ws(
 
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            info!("IN: {}", text);
             let user_msg: UserMsgIn = serde_json::from_str(text.as_str()).unwrap();
             if user_msg.message.len() > 128 {
                 continue;
@@ -927,8 +925,6 @@ async fn tweeter_ws(
                 message: user_msg.message.clone(),
             })
             .to_string();
-
-            info!("OUT: {}", out);
             let _ = tx.send(out.clone());
         }
     });
