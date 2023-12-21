@@ -1,3 +1,5 @@
+mod countries;
+
 use axum::{
     body::Bytes,
     extract::{
@@ -12,6 +14,7 @@ use axum::{
 use base64::{engine::general_purpose, Engine};
 use chrono::{DateTime, Utc};
 use cookie::Cookie;
+use dms_coordinates::DMS;
 use futures::{sink::SinkExt, stream::StreamExt};
 use git2::{Repository, Tree};
 use image::{io::Reader as ImageReader, GenericImageView, Pixel};
@@ -19,6 +22,7 @@ use itertools::Itertools;
 use log::info;
 use num_traits::PrimInt;
 use regex::Regex;
+use reverse_geocoder::ReverseGeocoder;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::{
@@ -32,6 +36,8 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::countries::countries;
 
 async fn ok() -> Result<String, StatusCode> {
     Ok(String::from("okay"))
@@ -962,7 +968,7 @@ fn find_room(state: &TweeterState, room_number: &usize) -> broadcast::Sender<Str
 }
 
 async fn archive_files(body: Bytes) -> Result<String, (StatusCode, String)> {
-    info!("20 archive files");
+    info!("20 archive files started");
     let mut a = Archive::new(body.as_ref());
 
     Ok(a.entries().unwrap().count().to_string())
@@ -980,7 +986,7 @@ async fn archive_files_size(body: Bytes) -> Result<String, (StatusCode, String)>
 }
 
 async fn cookie(body: Bytes) -> Result<String, (StatusCode, String)> {
-    info!("20 cookie size");
+    info!("20 cookie started");
     let mut a = Archive::new(body.as_ref());
     let temp_dir = tempdir().unwrap();
     a.unpack(temp_dir.path()).unwrap();
@@ -1042,6 +1048,34 @@ fn christmas_walk(tree: &Tree, repo: &Repository) -> Option<()> {
     None
 }
 
+async fn s2_coords(Path(s2_string): Path<String>) -> Result<String, (StatusCode, String)> {
+    info!("21 s2 coords started");
+    let s2_coords = u64::from_str_radix(s2_string.as_str(), 2).unwrap();
+    let cell = s2::cellid::CellID(s2_coords);
+    let ll = s2::latlng::LatLng::from(cell);
+    let mut lat = DMS::from_decimal_degrees(ll.lat.deg(), true);
+    let mut long = DMS::from_decimal_degrees(ll.lng.deg(), false);
+    lat.seconds = (lat.seconds * 1000.).round() / 1000.;
+    long.seconds = (long.seconds * 1000.).round() / 1000.;
+
+    Ok(format!("{} {}", lat.to_string(), long.to_string()))
+}
+
+async fn s2_country(Path(s2_string): Path<String>) -> Result<String, (StatusCode, String)> {
+    info!("21 s2 country started");
+    let s2_coords = u64::from_str_radix(s2_string.as_str(), 2).unwrap();
+    let cell = s2::cellid::CellID(s2_coords);
+    let ll = s2::latlng::LatLng::from(cell);
+
+    let geocoder = ReverseGeocoder::new();
+    let search_result = geocoder.search((ll.lat.deg(), ll.lng.deg()));
+    let cc = search_result.record.cc.clone();
+    let countries = countries();
+    let country = countries.get(&cc).unwrap();
+
+    Ok(country.clone())
+}
+
 #[shuttle_runtime::main]
 async fn axum(
     #[shuttle_shared_db::Postgres(
@@ -1098,7 +1132,9 @@ async fn axum(
         }))
         .route("/20/archive_files", post(archive_files))
         .route("/20/archive_files_size", post(archive_files_size))
-        .route("/20/cookie", post(cookie));
+        .route("/20/cookie", post(cookie))
+        .route("/21/coords/:s2", get(s2_coords))
+        .route("/21/country/:s2", get(s2_country));
 
     Ok(router.into())
 }
