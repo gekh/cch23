@@ -18,7 +18,7 @@ async fn strength(Json(reindeers): Json<Vec<Reindeer>>) -> Result<String, Status
     let mut sum = 0;
 
     for reindeer in reindeers {
-        sum += reindeer.strength
+        sum += reindeer.strength;
     }
 
     Ok(sum.to_string())
