@@ -4,7 +4,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket},
-        Multipart, Path, State, WebSocketUpgrade,
+        Multipart, Path, Query, State, WebSocketUpgrade,
     },
     http::{HeaderMap, StatusCode},
     response::Response,
@@ -138,6 +138,54 @@ struct ElfCount {
     elf_on_a_shelf: usize,
     #[serde(rename = "shelf with no elf on it")]
     no_elf: usize,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct Pagination {
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    split: usize,
+}
+
+async fn slicing_the_loop(
+    pagination: Query<Pagination>,
+    Json(names): Json<Vec<String>>,
+) -> Result<String, (StatusCode, String)> {
+    info!("5 started");
+    let start = if let Some(start) = pagination.offset {
+        if start > names.len() {
+            names.len()
+        } else {
+            start
+        }
+    } else {
+        0
+    };
+
+    let end = if let Some(limit) = pagination.limit {
+        if start + limit > names.len() {
+            names.len()
+        } else {
+            start + limit
+        }
+    } else {
+        names.len()
+    };
+
+    if pagination.split == 0 {
+        let out = serde_json::to_string(&names[start..end].to_vec()).unwrap();
+        Ok(out)
+    } else {
+        let chunks = names[start..end]
+            .chunks(pagination.split)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let out = serde_json::to_string(&chunks).unwrap();
+        Ok(out)
+    }
 }
 
 async fn elf_count(body: String) -> Result<Json<ElfCount>, StatusCode> {
@@ -1085,6 +1133,7 @@ async fn axum(
         .route("/1/*key", get(exclusive_cube))
         .route("/4/strength", post(strength))
         .route("/4/contest", post(contest))
+        .route("/5", post(slicing_the_loop))
         .route("/6", post(elf_count))
         .route("/7/decode", get(decode))
         .route("/7/bake", get(bake))
